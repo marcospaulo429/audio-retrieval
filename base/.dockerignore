@@ -26,18 +26,17 @@ build/
 *.md
 docs/
 
-# Data (don't include large datasets in image)
-data/raw/
-data/processed/
-*.wav
-*.mp3
-*.flac
-
-# Models (download separately or mount)
-models/checkpoints/
+# Large files (don't include in image)
+data/audio/*.wav
+data/audio/*.mp3
+data/audio/*.flac
 *.pth
 *.pt
 *.ckpt
+
+# Checkpoints (download separately)
+checkpoints/
+models/checkpoints/
 
 # Logs
 logs/
@@ -52,6 +51,5 @@ tests/
 Thumbs.db
 
 # Docker
-Dockerfile
-docker-compose.yml
 .dockerignore
+docker-compose.yml

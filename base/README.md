@@ -53,6 +53,25 @@ The project is organized into the following directories and files:
 
 3. Configure the training settings in `configs/config.yaml` as needed.
 
+## Docker
+# Build the Docker image
+docker build -t audio-retrieval:latest .
+
+# Run the container
+docker run -p 8000:8000 -v $(pwd)/data:/app/data audio-retrieval:latest
+
+# Or use docker-compose
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop
+docker-compose down
+
+# Rebuild after changes
+docker-compose up -d --build
+
 ## Usage
 
 To train the model, run the following command:
