@@ -1,0 +1,24 @@
+# Core dependencies
+torch>=2.0.0
+torchaudio>=2.0.0
+transformers>=4.30.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Audio processing
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# Training utilities
+tqdm>=4.65.0
+pyyaml>=6.0
+
+# Optional: Vector database for retrieval
+# faiss-cpu>=1.7.4  # or faiss-gpu for GPU support
+
+# Optional: API serving
+# fastapi>=0.100.0
+# uvicorn>=0.23.0
+
+# Optional: Logging
+# wandb>=0.15.0

@@ -1,0 +1,31 @@
+model:
+  audio_embedding_dim: 512
+  text_embedding_dim: 512
+  temperature: 0.07
+  learnable_temperature: true
+  text_model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  audio_model_type: "cnn"
+  dropout: 0.1
+
+training:
+  batch_size: 32
+  learning_rate: 0.0001
+  num_epochs: 50
+  weight_decay: 0.01
+  warmup_steps: 1000
+  gradient_clip: 1.0
+  mixed_precision: true
+
+paths:
+  audio_model_path: "models/audio_encoder.pth"
+  text_model_path: "models/text_encoder.pth"
+  joint_model_path: "models/joint_embedding.pth"
+  train_data_path: "data/train_data.csv"
+  val_data_path: "data/val_data.csv"
+  checkpoint_dir: "checkpoints"
+
+logging:
+  log_interval: 10
+  save_model_interval: 5
+  use_wandb: false
+  wandb_project: "audio-text-retrieval"
