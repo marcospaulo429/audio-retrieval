@@ -31,6 +31,3 @@ ENV PYTHONPATH=/app/src:$PYTHONPATH
 
 # Expose port for API (if using FastAPI/Flask)
 EXPOSE 8000
-
-# Default command (can be overridden)
-CMD ["python", "src/app.py", "--mode", "train"]
