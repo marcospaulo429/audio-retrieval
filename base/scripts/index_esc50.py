@@ -96,7 +96,8 @@ def index_audio_files(
     model,
     batch_size=100,
     collection_name="esc50",
-    chromadb_path="./chromadb"
+    chromadb_path="./chromadb",
+    distance_metric="cosine"
 ):
     """
     Index all ESC-50 audio files into ChromaDB.
@@ -109,6 +110,7 @@ def index_audio_files(
         batch_size: Number of items to add to ChromaDB per batch
         collection_name: Name of ChromaDB collection
         chromadb_path: Path to persist ChromaDB data
+        distance_metric: Distance metric ('cosine', 'l2', 'ip')
     """
     # Load dataset
     filename_to_category, df = load_esc50_dataset(esc50_path)
@@ -118,12 +120,13 @@ def index_audio_files(
     
     # ChromaDB setup with persistent storage
     print(f"Setting up ChromaDB (persistent storage at: {chromadb_path})...")
+    print(f"Distance metric: {distance_metric}")
     client = chromadb.PersistentClient(path=chromadb_path)
     
-    # Create or get collection with cosine similarity
+    # Create or get collection with specified distance metric
     collection = client.get_or_create_collection(
         name=collection_name,
-        metadata={"hnsw:space": "cosine"}
+        metadata={"hnsw:space": distance_metric}
     )
     
     # Check if collection already has data
@@ -135,7 +138,7 @@ def index_audio_files(
             client.delete_collection(name=collection_name)
             collection = client.get_or_create_collection(
                 name=collection_name,
-                metadata={"hnsw:space": "cosine"}
+                metadata={"hnsw:space": distance_metric}
             )
         else:
             print("Skipping indexing.")
@@ -241,8 +244,19 @@ def main():
         default="./chromadb",
         help="Path to persist ChromaDB data (default: ./chromadb)"
     )
+    parser.add_argument(
+        "--distance_metric",
+        type=str,
+        choices=['cosine', 'ip', 'l2'],
+        default='cosine',
+        help="Distance metric for ChromaDB (default: cosine)"
+    )
     
     args = parser.parse_args()
+    
+    # Generate collection name with distance metric
+    collection_name = f"{args.collection_name}_{args.distance_metric}"
+    print(f"Collection name: {collection_name}")
     
     # Setup environment
     device, processor, model = setup_environment()
@@ -254,8 +268,9 @@ def main():
         processor=processor,
         model=model,
         batch_size=args.batch_size,
-        collection_name=args.collection_name,
-        chromadb_path=args.chromadb_path
+        collection_name=collection_name,
+        chromadb_path=args.chromadb_path,
+        distance_metric=args.distance_metric
     )
 
 
