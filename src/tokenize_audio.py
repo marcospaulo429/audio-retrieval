@@ -14,10 +14,10 @@ except Exception:
 
 def sinusoidal_pos_encoding(length: int, d_model: int, device=None):
     pe = torch.zeros(length, d_model, device=device)
-    pos = torch.arange(0, length, dtype=torch.float, device=device).unsqueeze(1)
-    div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float, device=device) * (-math.log(10000.0) / d_model))
-    pe[:, 0::2] = torch.sin(pos * div)
-    pe[:, 1::2] = torch.cos(pos * div)
+    position = torch.arange(0, length, dtype=torch.float, device=device).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float, device=device) * (-math.log(10000.0) / d_model))
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
     return pe
 
 def tokenize_and_save(data_dir: str, output_dir: str, patch_size: int, d_model: int, pos_type: str, device_str: str, skip_existing: bool):
@@ -25,13 +25,13 @@ def tokenize_and_save(data_dir: str, output_dir: str, patch_size: int, d_model: 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(device_str)
-    proj = {}
+    projs = {}
     bad_files = []
-    files = sorted(p for p in data_dir.rglob("*.npy"))
-    it = tqdm(files, desc="Tokenizando", unit="file") if TQDM else files
+    files = sorted(p for p in data_dir.rglob("*.npy") if p.is_file())
+    iterator = tqdm(files, desc="Tokenizando", unit="file") if TQDM else files
     saved = 0
-    for p in it:
-        outp = output_dir / (p.relative_to(data_dir).with_suffix(".pt").as_posix())
+    for p in iterator:
+        outp = output_dir / p.relative_to(data_dir).with_suffix(".pt")
         if skip_existing and outp.exists():
             continue
         try:
@@ -52,10 +52,10 @@ def tokenize_and_save(data_dir: str, output_dir: str, patch_size: int, d_model: 
         P = T // patch_size
         patches = mel.view(F, P, patch_size).permute(1,0,2).contiguous().view(P, F * patch_size).to(device)  # (P, F*patch)
         key = f"{F}x{patch_size}"
-        if key not in proj:
-            proj[key] = nn.Linear(F * patch_size, d_model).to(device)
+        if key not in projs:
+            projs[key] = nn.Linear(F * patch_size, d_model).to(device)
         with torch.no_grad():
-            tokens = proj[key](patches)  # (P, d_model)
+            tokens = projs[key](patches)  # (P, d_model)
             if pos_type == "sinusoidal":
                 pe = sinusoidal_pos_encoding(tokens.size(0), d_model, device=device)
             else:
