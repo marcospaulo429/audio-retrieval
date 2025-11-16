@@ -1,9 +1,9 @@
 """
-Production/Research-Ready ESC-50 Experiment Script
+Production/Research-Ready Audio Classification Experiment Script
 
 This script provides a comprehensive experiment framework for evaluating
-retrieval-based audio classification with different models, distance metrics,
-and retrieval strategies.
+retrieval-based audio classification with different encoders, datasets,
+distance metrics, and retrieval strategies.
 
 Docker Usage (with GPU):
     docker run --gpus all \
@@ -12,7 +12,9 @@ Docker Usage (with GPU):
         -v $(pwd)/ESC-50:/app/data/ESC-50 \
         audio-retrieval-app \
         python scripts/run_experiment.py \
-            --esc50_path /app/data/ESC-50 \
+            --dataset_path /app/data/ESC-50 \
+            --dataset_name esc50 \
+            --encoder_name clap \
             --model_name laion/clap-htsat-unfused \
             --distance_metric cosine \
             --retrieval_strategy basic \
@@ -32,7 +34,6 @@ import chromadb
 import numpy as np
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from transformers import ClapProcessor
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -42,40 +43,7 @@ from PIL import Image
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from models.audio_encoder import CLAPAudioEncoder
-
-
-def setup_environment(model_name, use_gpu):
-    """
-    Setup device, processor, and model.
-    
-    Args:
-        model_name: CLAP model name
-        use_gpu: Whether to use GPU
-        
-    Returns:
-        device, processor, model
-    """
-    if use_gpu and torch.cuda.is_available():
-        device = "cuda"
-        print(f"Using device: {device} (GPU: {torch.cuda.get_device_name(0)})")
-    else:
-        device = "cpu"
-        if use_gpu:
-            print("Warning: GPU requested but not available, using CPU")
-        else:
-            print(f"Using device: {device}")
-    
-    # Load processor
-    print(f"Loading processor: {model_name}")
-    processor = ClapProcessor.from_pretrained(model_name)
-    
-    # Instantiate model
-    print(f"Loading model: {model_name}")
-    model = CLAPAudioEncoder(model_name=model_name, freeze=True).to(device)
-    model.eval()
-    
-    return device, processor, model
+from utils import load_model_and_processor, load_dataset_splits
 
 
 def get_collection_name(base_name, distance_metric):
@@ -125,9 +93,12 @@ def classify_audio_basic(
     device,
     processor,
     model,
+    target_sample_rate,
+    model_input_key,
     collection,
     k,
-    distance_metric
+    distance_metric,
+    chunk_id=None
 ):
     """
     Basic retrieval strategy: Query ChromaDB and perform weighted voting.
@@ -135,29 +106,57 @@ def classify_audio_basic(
     Args:
         audio_path: Path to audio file
         device: torch device
-        processor: ClapProcessor instance
-        model: CLAPAudioEncoder instance
+        processor: Processor instance (or None for custom_cnn)
+        model: Audio encoder model instance
+        target_sample_rate: Target sample rate for audio loading
+        model_input_key: Key to use when passing input to model
         collection: ChromaDB collection
         k: Number of nearest neighbors
         distance_metric: Distance metric used
+        chunk_id: Optional chunk ID for datasets with chunking (e.g., GTZAN)
         
     Returns:
         predicted_class, class_scores, neighbors
     """
-    # Load audio
-    audio_array, sr = librosa.load(audio_path, sr=48000)
+    # Load audio at target sample rate
+    audio_array, sr = librosa.load(audio_path, sr=target_sample_rate)
     
-    # Process audio
-    inputs = processor(
-        text=None,
-        audio=[audio_array],
-        return_tensors="pt",
-        sampling_rate=48000
-    ).to(device)
+    # Handle chunking for GTZAN (or other datasets with chunk_id)
+    if chunk_id is not None:
+        CHUNK_DURATION_SEC = 3
+        start_sample = int(chunk_id * CHUNK_DURATION_SEC * target_sample_rate)
+        end_sample = int((chunk_id + 1) * CHUNK_DURATION_SEC * target_sample_rate)
+        # Slice the audio array to get the specific chunk
+        audio_array = audio_array[start_sample:end_sample]
+    
+    # Prepare model input based on encoder type
+    if processor is not None:
+        # Use processor for encoders that require it
+        if model_input_key == 'input_features':
+            # CLAP processor
+            inputs = processor(
+                text=None,
+                audio=[audio_array],
+                return_tensors="pt",
+                sampling_rate=target_sample_rate
+            ).to(device)
+            model_input = inputs[model_input_key]
+        else:
+            # Wav2Vec2, HuBERT, AST processors
+            inputs = processor(
+                audio_array,
+                sampling_rate=target_sample_rate,
+                return_tensors="pt"
+            ).to(device)
+            model_input = inputs[model_input_key]
+    else:
+        # Custom CNN: process raw audio tensor directly
+        audio_tensor = torch.tensor(audio_array, dtype=torch.float32).unsqueeze(0).to(device)
+        model_input = audio_tensor
     
     # Generate query embedding
     with torch.no_grad():
-        query_embedding = model(inputs["input_features"])
+        query_embedding = model(model_input)
         query_embedding_np = query_embedding.cpu().numpy()[0]
     
     # Query ChromaDB
@@ -200,9 +199,12 @@ def classify_audio_rerank(
     device,
     processor,
     model,
+    target_sample_rate,
+    model_input_key,
     collection,
     k,
-    distance_metric
+    distance_metric,
+    chunk_id=None
 ):
     """
     Rerank retrieval strategy: Get 3*k candidates from ChromaDB, 
@@ -211,29 +213,57 @@ def classify_audio_rerank(
     Args:
         audio_path: Path to audio file
         device: torch device
-        processor: ClapProcessor instance
-        model: CLAPAudioEncoder instance
+        processor: Processor instance (or None for custom_cnn)
+        model: Audio encoder model instance
+        target_sample_rate: Target sample rate for audio loading
+        model_input_key: Key to use when passing input to model
         collection: ChromaDB collection
         k: Number of nearest neighbors (final)
         distance_metric: Distance metric used
+        chunk_id: Optional chunk ID for datasets with chunking (e.g., GTZAN)
         
     Returns:
         predicted_class, class_scores, neighbors
     """
-    # Load audio
-    audio_array, sr = librosa.load(audio_path, sr=48000)
+    # Load audio at target sample rate
+    audio_array, sr = librosa.load(audio_path, sr=target_sample_rate)
     
-    # Process audio
-    inputs = processor(
-        text=None,
-        audio=[audio_array],
-        return_tensors="pt",
-        sampling_rate=48000
-    ).to(device)
+    # Handle chunking for GTZAN (or other datasets with chunk_id)
+    if chunk_id is not None:
+        CHUNK_DURATION_SEC = 3
+        start_sample = int(chunk_id * CHUNK_DURATION_SEC * target_sample_rate)
+        end_sample = int((chunk_id + 1) * CHUNK_DURATION_SEC * target_sample_rate)
+        # Slice the audio array to get the specific chunk
+        audio_array = audio_array[start_sample:end_sample]
+    
+    # Prepare model input based on encoder type
+    if processor is not None:
+        # Use processor for encoders that require it
+        if model_input_key == 'input_features':
+            # CLAP processor
+            inputs = processor(
+                text=None,
+                audio=[audio_array],
+                return_tensors="pt",
+                sampling_rate=target_sample_rate
+            ).to(device)
+            model_input = inputs[model_input_key]
+        else:
+            # Wav2Vec2, HuBERT, AST processors
+            inputs = processor(
+                audio_array,
+                sampling_rate=target_sample_rate,
+                return_tensors="pt"
+            ).to(device)
+            model_input = inputs[model_input_key]
+    else:
+        # Custom CNN: process raw audio tensor directly
+        audio_tensor = torch.tensor(audio_array, dtype=torch.float32).unsqueeze(0).to(device)
+        model_input = audio_tensor
     
     # Generate query embedding
     with torch.no_grad():
-        query_embedding = model(inputs["input_features"])  # [1, embedding_dim]
+        query_embedding = model(model_input)  # [1, embedding_dim]
     
     # Query ChromaDB for 3*k candidates (fast HNSW search)
     n_candidates = k * 3
@@ -316,10 +346,13 @@ def classify_audio(
     device,
     processor,
     model,
+    target_sample_rate,
+    model_input_key,
     collection,
     k,
     distance_metric,
-    retrieval_strategy
+    retrieval_strategy,
+    chunk_id=None
 ):
     """
     Classify audio using specified retrieval strategy.
@@ -327,43 +360,33 @@ def classify_audio(
     Args:
         audio_path: Path to audio file
         device: torch device
-        processor: ClapProcessor instance
-        model: CLAPAudioEncoder instance
+        processor: Processor instance (or None for custom_cnn)
+        model: Audio encoder model instance
+        target_sample_rate: Target sample rate for audio loading
+        model_input_key: Key to use when passing input to model
         collection: ChromaDB collection
         k: Number of nearest neighbors
         distance_metric: Distance metric
         retrieval_strategy: 'basic' or 'rerank'
+        chunk_id: Optional chunk ID for datasets with chunking (e.g., GTZAN)
         
     Returns:
         predicted_class, class_scores, neighbors
     """
     if retrieval_strategy == 'basic':
         return classify_audio_basic(
-            audio_path, device, processor, model, collection, k, distance_metric
+            audio_path, device, processor, model, target_sample_rate, model_input_key,
+            collection, k, distance_metric, chunk_id=chunk_id
         )
     elif retrieval_strategy == 'rerank':
         return classify_audio_rerank(
-            audio_path, device, processor, model, collection, k, distance_metric
+            audio_path, device, processor, model, target_sample_rate, model_input_key,
+            collection, k, distance_metric, chunk_id=chunk_id
         )
     else:
         raise ValueError(f"Unknown retrieval strategy: {retrieval_strategy}")
 
 
-def load_test_set(esc50_path):
-    """Load test set files (fold 5)."""
-    meta_path = os.path.join(esc50_path, "meta", "esc50.csv")
-    
-    if not os.path.exists(meta_path):
-        raise FileNotFoundError(
-            f"ESC-50 metadata not found at {meta_path}\n"
-            "Please download ESC-50 from: https://github.com/karolpiczak/ESC-50"
-        )
-    
-    df = pd.read_csv(meta_path)
-    test_df = df[df['fold'] == 5].copy()
-    
-    print(f"Test set: {len(test_df)} files (fold 5)")
-    return test_df, df
 
 
 def plot_confusion_matrix_to_image(y_true, y_pred, labels):
@@ -397,7 +420,7 @@ def plot_confusion_matrix_to_image(y_true, y_pred, labels):
     
     ax.set_xlabel('Predicted', fontsize=12)
     ax.set_ylabel('True', fontsize=12)
-    ax.set_title('Confusion Matrix - ESC-50 Classification', fontsize=14, pad=20)
+    ax.set_title('Confusion Matrix - Audio Classification', fontsize=14, pad=20)
     plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
     plt.setp(ax.get_yticklabels(), rotation=0)
     plt.tight_layout()
@@ -414,10 +437,12 @@ def plot_confusion_matrix_to_image(y_true, y_pred, labels):
 
 
 def evaluate_test_set(
-    esc50_path,
+    test_df,
     device,
     processor,
     model,
+    target_sample_rate,
+    model_input_key,
     collection,
     k,
     distance_metric,
@@ -429,10 +454,12 @@ def evaluate_test_set(
     Evaluate the classification pipeline on the test set.
     
     Args:
-        esc50_path: Path to ESC-50 dataset directory
+        test_df: DataFrame with 'file_path' and 'label' columns
         device: torch device
-        processor: ClapProcessor instance
-        model: CLAPAudioEncoder instance
+        processor: Processor instance (or None for custom_cnn)
+        model: Audio encoder model instance
+        target_sample_rate: Target sample rate for audio loading
+        model_input_key: Key to use when passing input to model
         collection: ChromaDB collection
         k: Number of nearest neighbors
         distance_metric: Distance metric
@@ -443,29 +470,27 @@ def evaluate_test_set(
     Returns:
         y_true, y_pred, all_labels, metrics_dict
     """
-    # Load test set
-    test_df, full_df = load_test_set(esc50_path)
-    all_labels = sorted(full_df['category'].unique())
+    # Get all unique labels
+    all_labels = sorted(test_df['label'].unique())
     
     # Initialize lists
     y_true = []
     y_pred = []
-    
-    audio_dir = os.path.join(esc50_path, "audio")
     
     # Evaluation loop
     print(f"\nRunning inference on {len(test_df)} test files...")
     print(f"Strategy: {retrieval_strategy}, Distance: {distance_metric}, k: {k}")
     
     for idx, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Evaluating"):
-        filename = row['filename']
-        real_label = row['category']
-        
-        audio_path = os.path.join(audio_dir, filename)
+        audio_path = row['file_path']
+        real_label = row['label']
         
         if not os.path.exists(audio_path):
             print(f"Warning: Audio file not found: {audio_path}")
             continue
+        
+        # Get chunk_id if present (for GTZAN)
+        chunk_id = row.get('chunk_id', None)
         
         try:
             predicted_label, _, _ = classify_audio(
@@ -473,16 +498,20 @@ def evaluate_test_set(
                 device=device,
                 processor=processor,
                 model=model,
+                target_sample_rate=target_sample_rate,
+                model_input_key=model_input_key,
                 collection=collection,
                 k=k,
                 distance_metric=distance_metric,
-                retrieval_strategy=retrieval_strategy
+                retrieval_strategy=retrieval_strategy,
+                chunk_id=chunk_id
             )
             
             y_true.append(real_label)
             y_pred.append(predicted_label)
         
         except Exception as e:
+            filename = os.path.basename(audio_path)
             print(f"\nError processing {filename}: {e}")
             continue
     
@@ -512,24 +541,39 @@ def evaluate_test_set(
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Production/Research-Ready ESC-50 Experiment Script",
+        description="Production/Research-Ready Audio Classification Experiment Script",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
     # Required arguments
     parser.add_argument(
-        "--esc50_path",
+        "--dataset_path",
         type=str,
-        required=True,
-        help="Path to ESC-50 dataset directory"
+        default=None,
+        help="Path to dataset directory (optional for Hugging Face datasets, use 'hf:dataset_name')"
+    )
+    
+    # Dataset arguments
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default="esc50",
+        help="Dataset name. Options: 'esc50', 'urbansound8k', 'gtzan', 'nsynth', 'audioset', or 'hf:dataset_name' for Hugging Face datasets (default: esc50)"
     )
     
     # Model arguments
     parser.add_argument(
+        "--encoder_name",
+        type=str,
+        default="clap",
+        choices=['clap', 'wav2vec2', 'hubert', 'ast', 'custom_cnn'],
+        help="Encoder name (default: clap)"
+    )
+    parser.add_argument(
         "--model_name",
         type=str,
         default="laion/clap-htsat-unfused",
-        help="CLAP model name for CLAPAudioEncoder"
+        help="Hugging Face model name or path (default: laion/clap-htsat-unfused)"
     )
     
     # ChromaDB arguments
@@ -545,12 +589,6 @@ def main():
         type=str,
         default="./chromadb",
         help="Path to ChromaDB persistent storage"
-    )
-    parser.add_argument(
-        "--collection_base_name",
-        type=str,
-        default="esc50",
-        help="Base name for ChromaDB collection (will be appended with distance metric)"
     )
     
     # Retrieval arguments
@@ -593,12 +631,51 @@ def main():
     
     args = parser.parse_args()
     
-    # Generate collection name
-    collection_name = get_collection_name(args.collection_base_name, args.distance_metric)
+    # Validate dataset_path for non-HF datasets
+    # Allow nsynth without dataset_path (it tries to load from Hugging Face first)
+    if not args.dataset_name.startswith('hf:') and args.dataset_name != 'nsynth' and args.dataset_path is None:
+        parser.error("--dataset_path is required for non-Hugging Face datasets")
+    
+    # Setup device
+    if args.use_gpu and torch.cuda.is_available():
+        device = "cuda"
+        print(f"Using device: {device} (GPU: {torch.cuda.get_device_name(0)})")
+    else:
+        device = "cpu"
+        if args.use_gpu:
+            print("Warning: GPU requested but not available, using CPU")
+        else:
+            print(f"Using device: {device}")
+    
+    # Load model and processor using factory function
+    print(f"\nLoading encoder: {args.encoder_name}")
+    print(f"Model: {args.model_name}")
+    model, processor, target_sample_rate, model_input_key = load_model_and_processor(
+        encoder_name=args.encoder_name,
+        model_name_or_path=args.model_name,
+        device=device
+    )
+    print(f"Target sample rate: {target_sample_rate} Hz")
+    print(f"Model input key: {model_input_key}")
+    
+    # Load dataset splits using factory function
+    print(f"\nLoading dataset: {args.dataset_name}")
+    # For Hugging Face datasets or nsynth, dataset_path can be None
+    train_df, test_df = load_dataset_splits(
+        dataset_name=args.dataset_name,
+        dataset_path=args.dataset_path
+    )
+    
+    # Generate collection name: dataset_encoder_distance
+    # For Hugging Face datasets, sanitize the name (replace ':' and '/' with '_')
+    dataset_name_clean = args.dataset_name.replace(':', '_').replace('/', '_')
+    collection_name = f"{dataset_name_clean}_{args.encoder_name}_{args.distance_metric}"
     
     print("="*70)
-    print("ESC-50 Experiment Configuration")
+    print("Experiment Configuration")
     print("="*70)
+    print(f"Dataset: {args.dataset_name}")
+    print(f"Encoder: {args.encoder_name}")
     print(f"Model: {args.model_name}")
     print(f"Distance Metric: {args.distance_metric}")
     print(f"Retrieval Strategy: {args.retrieval_strategy}")
@@ -606,12 +683,7 @@ def main():
     print(f"Collection: {collection_name}")
     print(f"ChromaDB Path: {args.chromadb_path}")
     print(f"Log Dir: {args.log_dir}")
-    print(f"GPU: {args.use_gpu}")
     print("="*70)
-    
-    # Setup environment
-    print("\nSetting up environment...")
-    device, processor, model = setup_environment(args.model_name, args.use_gpu)
     
     # Setup ChromaDB
     print(f"\nConnecting to ChromaDB collection: {collection_name}")
@@ -622,7 +694,10 @@ def main():
         print(f"Collection found with {collection.count()} items")
     except Exception as e:
         print(f"Error: Collection '{collection_name}' not found!")
-        print(f"Please run index_esc50.py first with distance_metric={args.distance_metric}")
+        print(f"Please run index_esc50.py first with:")
+        print(f"  --dataset_name {args.dataset_name}")
+        print(f"  --encoder_name {args.encoder_name}")
+        print(f"  --distance_metric {args.distance_metric}")
         print(f"Error details: {e}")
         return
     
@@ -630,18 +705,17 @@ def main():
     os.makedirs(args.log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=args.log_dir)
     
-    # Create experiment tag for TensorBoard
-    experiment_tag = f"{args.model_name.split('/')[-1]}_{args.distance_metric}_{args.retrieval_strategy}_k{args.k}"
-    
     print(f"\nTensorBoard logs will be saved to: {args.log_dir}")
     print(f"View with: tensorboard --logdir {args.log_dir}")
     
     # Evaluate test set
     y_true, y_pred, all_labels, metrics = evaluate_test_set(
-        esc50_path=args.esc50_path,
+        test_df=test_df,
         device=device,
         processor=processor,
         model=model,
+        target_sample_rate=target_sample_rate,
+        model_input_key=model_input_key,
         collection=collection,
         k=args.k,
         distance_metric=args.distance_metric,
@@ -677,7 +751,7 @@ def main():
         )
         plt.xlabel('Predicted', fontsize=12)
         plt.ylabel('True', fontsize=12)
-        plt.title('Confusion Matrix - ESC-50 Classification', fontsize=14, pad=20)
+        plt.title('Confusion Matrix - Audio Classification', fontsize=14, pad=20)
         plt.xticks(rotation=45, ha='right')
         plt.yticks(rotation=0)
         plt.tight_layout()

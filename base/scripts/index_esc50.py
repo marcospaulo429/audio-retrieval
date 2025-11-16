@@ -1,122 +1,49 @@
 """
-ESC-50 Indexing Pipeline
-Indexes all ESC-50 audio files into ChromaDB using CLAPAudioEncoder.
+Generic Audio Dataset Indexing Pipeline
+Indexes audio files into ChromaDB using various audio encoders.
 """
 
 import os
 import sys
 from pathlib import Path
-import pandas as pd
 import torch
 import librosa
 import chromadb
 from tqdm import tqdm
-from transformers import ClapProcessor
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from models.audio_encoder import CLAPAudioEncoder
-
-
-def setup_environment():
-    """Setup device, processor, and model."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    
-    model_name = "laion/clap-htsat-unfused"
-    
-    # Load processor
-    print(f"Loading processor: {model_name}")
-    processor = ClapProcessor.from_pretrained(model_name)
-    
-    # Instantiate model
-    print(f"Loading model: {model_name}")
-    model = CLAPAudioEncoder(model_name=model_name, freeze=True).to(device)
-    model.eval()
-    
-    return device, processor, model
-
-
-def load_esc50_dataset(esc50_path):
-    """
-    Load ESC-50 dataset metadata.
-    
-    Args:
-        esc50_path: Path to ESC-50 dataset directory
-        
-    Returns:
-        DataFrame with filename and category mapping
-    """
-    meta_path = os.path.join(esc50_path, "meta", "esc50.csv")
-    
-    if not os.path.exists(meta_path):
-        raise FileNotFoundError(
-            f"ESC-50 metadata not found at {meta_path}\n"
-            "Please download ESC-50 from: https://github.com/karolpiczak/ESC-50\n"
-            "Expected structure:\n"
-            "  ESC-50/\n"
-            "    meta/\n"
-            "      esc50.csv\n"
-            "    audio/\n"
-            "      *.wav"
-        )
-    
-    df = pd.read_csv(meta_path)
-    
-    # Create mapping: filename -> category
-    filename_to_category = dict(zip(df['filename'], df['category']))
-    
-    print(f"Loaded {len(filename_to_category)} audio file mappings")
-    return filename_to_category, df
-
-
-def get_indexing_files(df):
-    """
-    Get list of filenames for indexing (folds 1-4).
-    
-    Args:
-        df: DataFrame with ESC-50 metadata
-        
-    Returns:
-        List of filenames to index
-    """
-    # Indexing Set: Files where fold is 1, 2, 3, or 4
-    indexing_df = df[df['fold'].isin([1, 2, 3, 4])]
-    indexing_files = indexing_df['filename'].tolist()
-    
-    print(f"Indexing set: {len(indexing_files)} files (folds 1-4)")
-    return indexing_files
+from utils import load_model_and_processor, load_dataset_splits
 
 
 def index_audio_files(
-    esc50_path,
+    train_df,
     device,
     processor,
     model,
+    target_sample_rate,
+    model_input_key,
     batch_size=100,
-    collection_name="esc50",
+    collection_name="dataset",
     chromadb_path="./chromadb",
     distance_metric="cosine"
 ):
     """
-    Index all ESC-50 audio files into ChromaDB.
+    Index audio files into ChromaDB.
     
     Args:
-        esc50_path: Path to ESC-50 dataset directory
+        train_df: DataFrame with 'file_path' and 'label' columns
         device: torch device
-        processor: ClapProcessor instance
-        model: CLAPAudioEncoder instance
+        processor: Processor instance (or None for custom_cnn)
+        model: Audio encoder model instance
+        target_sample_rate: Target sample rate for audio loading
+        model_input_key: Key to use when passing input to model
         batch_size: Number of items to add to ChromaDB per batch
         collection_name: Name of ChromaDB collection
         chromadb_path: Path to persist ChromaDB data
         distance_metric: Distance metric ('cosine', 'l2', 'ip')
     """
-    # Load dataset
-    filename_to_category, df = load_esc50_dataset(esc50_path)
-    
-    # Get indexing files (folds 1-4)
-    indexing_files = get_indexing_files(df)
     
     # ChromaDB setup with persistent storage
     print(f"Setting up ChromaDB (persistent storage at: {chromadb_path})...")
@@ -144,42 +71,67 @@ def index_audio_files(
             print("Skipping indexing.")
             return
     
-    audio_dir = os.path.join(esc50_path, "audio")
-    
-    print(f"Indexing {len(indexing_files)} audio files from folds 1-4")
+    print(f"Indexing {len(train_df)} audio files")
     
     # Batch storage
     embeddings_batch = []
     ids_batch = []
     metadatas_batch = []
     
-    # Indexing loop - only process files from indexing set (folds 1-4)
+    # Indexing loop
     with torch.no_grad():
-        for idx, filename in enumerate(tqdm(indexing_files, desc="Indexing audio files")):
-            audio_path = os.path.join(audio_dir, filename)
+        for idx, row in tqdm(train_df.iterrows(), total=len(train_df), desc="Indexing audio files"):
+            audio_path = row['file_path']
+            label = row['label']
+            filename = os.path.basename(audio_path)
             
             try:
-                # Load audio with librosa (CLAP expects 48kHz)
-                audio_array, sr = librosa.load(audio_path, sr=48000)
+                # Load audio with librosa at target sample rate
+                audio_array, sr = librosa.load(audio_path, sr=target_sample_rate)
                 
-                # Use processor to format the audio
-                inputs = processor(
-                    text=None,
-                    audio=[audio_array],  # Use 'audio' instead of deprecated 'audios'
-                    return_tensors="pt",
-                    sampling_rate=48000
-                ).to(device)
+                # Handle chunking for GTZAN (or other datasets with chunk_id)
+                if 'chunk_id' in row:
+                    chunk_id = row['chunk_id']
+                    CHUNK_DURATION_SEC = 3
+                    start_sample = int(chunk_id * CHUNK_DURATION_SEC * target_sample_rate)
+                    end_sample = int((chunk_id + 1) * CHUNK_DURATION_SEC * target_sample_rate)
+                    # Slice the audio array to get the specific chunk
+                    audio_array = audio_array[start_sample:end_sample]
+                    # Update filename to include chunk_id for unique identification
+                    filename = f"{os.path.splitext(filename)[0]}_chunk{chunk_id}{os.path.splitext(filename)[1]}"
+                
+                # Prepare model input based on encoder type
+                if processor is not None:
+                    # Use processor for encoders that require it
+                    if model_input_key == 'input_features':
+                        # CLAP processor
+                        inputs = processor(
+                            text=None,
+                            audio=[audio_array],
+                            return_tensors="pt",
+                            sampling_rate=target_sample_rate
+                        ).to(device)
+                        model_input = inputs[model_input_key]
+                    else:
+                        # Wav2Vec2, HuBERT, AST processors
+                        inputs = processor(
+                            audio_array,
+                            sampling_rate=target_sample_rate,
+                            return_tensors="pt"
+                        ).to(device)
+                        model_input = inputs[model_input_key]
+                else:
+                    # Custom CNN: process raw audio tensor directly
+                    audio_tensor = torch.tensor(audio_array, dtype=torch.float32).unsqueeze(0).to(device)
+                    model_input = audio_tensor
                 
                 # Get embedding
-                embedding = model(inputs["input_features"])
+                embedding = model(model_input)
                 embedding_np = embedding.cpu().numpy()[0]  # Remove batch dimension
-                
-                # Get label from CSV
-                category = filename_to_category.get(filename, "unknown")
                 
                 # Prepare metadata
                 metadata = {
-                    "label": category,
+                    "label": label,
                     "filename": filename
                 }
                 
@@ -219,24 +171,37 @@ def main():
     """Main entry point."""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Index ESC-50 dataset into ChromaDB")
+    parser = argparse.ArgumentParser(description="Index audio dataset into ChromaDB")
     parser.add_argument(
-        "--esc50_path",
+        "--dataset_path",
         type=str,
-        required=True,
-        help="Path to ESC-50 dataset directory"
+        default=None,
+        help="Path to dataset directory (optional for Hugging Face datasets, use 'hf:dataset_name')"
+    )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default="esc50",
+        help="Dataset name. Options: 'esc50', 'urbansound8k', 'gtzan', 'nsynth', 'audioset', or 'hf:dataset_name' for Hugging Face datasets (default: esc50)"
+    )
+    parser.add_argument(
+        "--encoder_name",
+        type=str,
+        default="clap",
+        choices=['clap', 'wav2vec2', 'hubert', 'ast', 'custom_cnn'],
+        help="Encoder name (default: clap)"
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="laion/clap-htsat-unfused",
+        help="Hugging Face model name or path (default: laion/clap-htsat-unfused)"
     )
     parser.add_argument(
         "--batch_size",
         type=int,
         default=100,
         help="Batch size for ChromaDB insertion (default: 100)"
-    )
-    parser.add_argument(
-        "--collection_name",
-        type=str,
-        default="esc50",
-        help="ChromaDB collection name (default: esc50)"
     )
     parser.add_argument(
         "--chromadb_path",
@@ -251,22 +216,63 @@ def main():
         default='cosine',
         help="Distance metric for ChromaDB (default: cosine)"
     )
+    parser.add_argument(
+        "--use_gpu",
+        action="store_true",
+        help="Use GPU if available"
+    )
     
     args = parser.parse_args()
     
-    # Generate collection name with distance metric
-    collection_name = f"{args.collection_name}_{args.distance_metric}"
-    print(f"Collection name: {collection_name}")
+    # Validate dataset_path for non-HF datasets
+    # Allow nsynth without dataset_path (it tries to load from Hugging Face first)
+    if not args.dataset_name.startswith('hf:') and args.dataset_name != 'nsynth' and args.dataset_path is None:
+        parser.error("--dataset_path is required for non-Hugging Face datasets")
     
-    # Setup environment
-    device, processor, model = setup_environment()
+    # Setup device
+    if args.use_gpu and torch.cuda.is_available():
+        device = "cuda"
+        print(f"Using device: {device} (GPU: {torch.cuda.get_device_name(0)})")
+    else:
+        device = "cpu"
+        if args.use_gpu:
+            print("Warning: GPU requested but not available, using CPU")
+        else:
+            print(f"Using device: {device}")
+    
+    # Load model and processor using factory function
+    print(f"\nLoading encoder: {args.encoder_name}")
+    print(f"Model: {args.model_name}")
+    model, processor, target_sample_rate, model_input_key = load_model_and_processor(
+        encoder_name=args.encoder_name,
+        model_name_or_path=args.model_name,
+        device=device
+    )
+    print(f"Target sample rate: {target_sample_rate} Hz")
+    print(f"Model input key: {model_input_key}")
+    
+    # Load dataset splits using factory function
+    print(f"\nLoading dataset: {args.dataset_name}")
+    # For Hugging Face datasets or nsynth, dataset_path can be None
+    train_df, test_df = load_dataset_splits(
+        dataset_name=args.dataset_name,
+        dataset_path=args.dataset_path
+    )
+    
+    # Generate collection name: dataset_encoder_distance
+    # For Hugging Face datasets, sanitize the name (replace ':' and '/' with '_')
+    dataset_name_clean = args.dataset_name.replace(':', '_').replace('/', '_')
+    collection_name = f"{dataset_name_clean}_{args.encoder_name}_{args.distance_metric}"
+    print(f"\nCollection name: {collection_name}")
     
     # Index audio files
     index_audio_files(
-        esc50_path=args.esc50_path,
+        train_df=train_df,
         device=device,
         processor=processor,
         model=model,
+        target_sample_rate=target_sample_rate,
+        model_input_key=model_input_key,
         batch_size=args.batch_size,
         collection_name=collection_name,
         chromadb_path=args.chromadb_path,
