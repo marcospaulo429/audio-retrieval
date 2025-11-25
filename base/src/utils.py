@@ -126,19 +126,19 @@ def load_dataset_splits(
     Factory function to load and split dataset into train and test sets.
     
     Args:
-        dataset_name: Name of the dataset ('esc50', 'urbansound8k', 'gtzan', 'nsynth', 'audioset', or 'hf:dataset_name' for Hugging Face)
+        dataset_name: Name of the dataset ('esc50', 'urbansound8k', 'gtzan', 'nsynth', 'audioset', 'clotho', or 'hf:dataset_name' for Hugging Face)
         dataset_path: Path to the dataset directory (optional for Hugging Face datasets)
         
     Returns:
         Tuple of (train_df, test_df)
-        Both DataFrames have columns: 'file_path' (full path to audio) and 'label' (class)
-        For GTZAN, also includes 'chunk_id' column (0-9)
+        DataFrames have columns: 'file_path' and 'label' (for classification) or 'caption' (for captioning)
+        Clotho returns DataFrames with 'file_path' and 'caption' columns (5 captions per audio)
     """
     dataset_name = dataset_name.lower()
     
     # Validate dataset_path for non-HF datasets
-    # Allow nsynth without dataset_path (it tries to load from Hugging Face first)
-    if not dataset_name.startswith('hf:') and dataset_name != 'nsynth' and dataset_path is None:
+    # Allow nsynth and clotho without dataset_path (they try to load from Hugging Face first)
+    if not dataset_name.startswith('hf:') and dataset_name not in ['nsynth', 'clotho'] and dataset_path is None:
         raise ValueError(f"dataset_path is required for dataset '{dataset_name}'")
     
     if dataset_name == 'esc50':
@@ -532,6 +532,131 @@ def load_dataset_splits(
         
         return train_df, test_df
         
+    elif dataset_name == 'clotho':
+        # Clotho: Audio captioning dataset with 5 captions per audio
+        hf_error = None
+        
+        # Try 1: Load from Hugging Face
+        try:
+            from datasets import load_dataset
+            print("Attempting to load Clotho from Hugging Face...")
+            
+            # Load Clotho v2 dataset (or specify v1 if needed)
+            dataset = load_dataset("antonjoo/clotho")  # or "clotho-dataset/clotho_v2"
+            
+            def extract_clotho_data(split):
+                """Extract audio paths and captions from Clotho split."""
+                if split not in dataset:
+                    return None
+                
+                data = []
+                for item in dataset[split]:
+                    audio_path = item['audio']['path']
+                    # Clotho has 5 captions per audio (caption_1 to caption_5)
+                    for i in range(1, 6):
+                        caption_key = f'caption_{i}'
+                        if caption_key in item:
+                            data.append({
+                                'file_path': audio_path,
+                                'caption': item[caption_key]
+                            })
+                return pd.DataFrame(data)
+            
+            train_df = extract_clotho_data('train') or extract_clotho_data('development')
+            test_df = extract_clotho_data('test') or extract_clotho_data('evaluation')
+            
+            # If validation split exists, use it as test
+            if test_df is None or len(test_df) == 0:
+                test_df = extract_clotho_data('validation')
+            
+            print(f"Clotho dataset loaded from Hugging Face:")
+            print(f"  Training set: {len(train_df)} captions ({len(train_df) // 5} audio files)")
+            print(f"  Test set: {len(test_df)} captions ({len(test_df) // 5} audio files)")
+            
+            return train_df, test_df
+            
+        except Exception as e:
+            hf_error = str(e)
+            print(f"Could not load from Hugging Face: {hf_error}")
+            print("Falling back to local CSV files...")
+            
+            if dataset_path is None:
+                raise ValueError(
+                    f"Could not load Clotho from Hugging Face.\n"
+                    f"Error: {hf_error}\n\n"
+                    "Solutions:\n"
+                    "  1. Download Clotho dataset locally and provide --dataset_path:\n"
+                    "     Download from: https://zenodo.org/record/3490684\n"
+                    "     Then use: --dataset_path /path/to/clotho --dataset_name clotho\n\n"
+                    "  2. Use Hugging Face format: --dataset_name hf:antonjoo/clotho"
+                )
+            
+            # Load from local CSV files
+            dev_csv = os.path.join(dataset_path, "clotho_captions_development.csv")
+            eval_csv = os.path.join(dataset_path, "clotho_captions_evaluation.csv")
+            val_csv = os.path.join(dataset_path, "clotho_captions_validation.csv")
+            
+            if not os.path.exists(dev_csv):
+                raise FileNotFoundError(
+                    f"Clotho CSV not found at {dev_csv}\n"
+                    "Please download Clotho from: https://zenodo.org/record/3490684\n"
+                    "Expected structure:\n"
+                    "  clotho/\n"
+                    "    clotho_captions_development.csv\n"
+                    "    clotho_captions_evaluation.csv\n"
+                    "    development/\n"
+                    "      *.wav\n"
+                    "    evaluation/\n"
+                    "      *.wav"
+                )
+            
+            def load_clotho_csv(csv_path, audio_dir):
+                """Load Clotho CSV and expand captions."""
+                df = pd.read_csv(csv_path)
+                data = []
+                
+                for _, row in df.iterrows():
+                    file_name = row['file_name']
+                    file_path = os.path.join(audio_dir, file_name)
+                    
+                    # Add all 5 captions
+                    for i in range(1, 6):
+                        caption_col = f'caption_{i}'
+                        if caption_col in row and pd.notna(row[caption_col]):
+                            data.append({
+                                'file_path': file_path,
+                                'caption': row[caption_col]
+                            })
+                
+                return pd.DataFrame(data)
+            
+            # Load development as train
+            dev_audio_dir = os.path.join(dataset_path, "development")
+            train_df = load_clotho_csv(dev_csv, dev_audio_dir)
+            
+            # Load evaluation or validation as test
+            if os.path.exists(eval_csv):
+                eval_audio_dir = os.path.join(dataset_path, "evaluation")
+                test_df = load_clotho_csv(eval_csv, eval_audio_dir)
+            elif os.path.exists(val_csv):
+                val_audio_dir = os.path.join(dataset_path, "validation")
+                test_df = load_clotho_csv(val_csv, val_audio_dir)
+            else:
+                # Split dev into train/test
+                train_df, test_df = train_test_split(
+                    train_df,
+                    test_size=0.2,
+                    random_state=42
+                )
+                train_df = train_df.reset_index(drop=True)
+                test_df = test_df.reset_index(drop=True)
+            
+            print(f"Clotho dataset loaded from local files:")
+            print(f"  Training set: {len(train_df)} captions ({len(train_df) // 5} audio files)")
+            print(f"  Test set: {len(test_df)} captions ({len(test_df) // 5} audio files)")
+            
+            return train_df, test_df
+    
     elif dataset_name.startswith('hf:'):
         # Hugging Face dataset: format is 'hf:dataset_name' or 'hf:dataset_name/config_name'
         # Example: 'hf:common_voice' or 'hf:common_voice/en'
@@ -656,7 +781,7 @@ def load_dataset_splits(
     else:
         raise ValueError(
             f"Unknown dataset_name: {dataset_name}. "
-            f"Supported: 'esc50', 'urbansound8k', 'gtzan', 'nsynth', 'audioset', or 'hf:dataset_name' for Hugging Face datasets"
+            f"Supported: 'esc50', 'urbansound8k', 'gtzan', 'nsynth', 'audioset', 'clotho', or 'hf:dataset_name' for Hugging Face datasets"
         )
 
 

@@ -105,7 +105,38 @@ def main():
     
     if args.mode == 'train':
         print("Starting training...")
-        train_model(config, device, checkpoint_path=args.checkpoint)
+        config_dict = {
+            'audio_encoder': {
+                'name': config.audio_encoder.name,
+                'model_name': config.audio_encoder.model_name,
+                'embedding_dim': config.audio_encoder.embedding_dim,
+                'freeze': config.audio_encoder.freeze
+            },
+            'text_encoder': {
+                'model_name': config.text_encoder.model_name,
+                'embedding_dim': config.text_encoder.embedding_dim,
+                'dropout': config.text_encoder.dropout
+            },
+            'dataset': {
+                'name': config.dataset.name,
+                'path': config.dataset.path,
+                'max_audio_length': config.dataset.max_audio_length,
+                'max_text_length': config.dataset.max_text_length
+            },
+            'training': {
+                'batch_size': config.training.batch_size,
+                'num_epochs': config.training.num_epochs,
+                'learning_rate': config.training.learning_rate,
+                'weight_decay': config.training.weight_decay,
+                'gradient_clip': config.training.gradient_clip,
+                'mixed_precision': config.training.mixed_precision,
+                'num_workers': config.training.num_workers
+            },
+            'temperature': config.model.temperature,
+            'learnable_temperature': config.model.learnable_temperature,
+            'checkpoint_dir': config.paths.checkpoints
+        }
+        train_model(config_dict, device, checkpoint_path=args.checkpoint)
     
     elif args.mode == 'inference':
         print("Running inference...")

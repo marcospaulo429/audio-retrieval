@@ -4,6 +4,7 @@ import torchaudio
 import pandas as pd
 from pathlib import Path
 from typing import Optional, Tuple, Union
+import soundfile as sf
 
 
 class AudioTextDataset(Dataset):
@@ -63,7 +64,7 @@ class AudioTextDataset(Dataset):
         self.audio_cache = {} if cache_audio else None
         self._resampler = None
         
-        print(f"Loaded {len(self.data)} audio-text pairs from {data_path}")
+        print(f"Loaded {len(self.data)} audio-text pairs from {self.data.shape}")
     
     def __len__(self) -> int:
         return len(self.data)
@@ -85,7 +86,7 @@ class AudioTextDataset(Dataset):
         return audio, text
     
     def _load_audio(self, audio_path: str, idx: int) -> torch.Tensor:
-        """Load and preprocess audio file."""
+        """Load and preprocess audio file using soundfile."""
         
         # Check cache
         if self.audio_cache is not None and idx in self.audio_cache:
@@ -100,51 +101,66 @@ class AudioTextDataset(Dataset):
         if not full_path.exists():
             raise FileNotFoundError(f"Audio file not found: {full_path}")
         
-        # Load audio
-        waveform, orig_sr = torchaudio.load(full_path)
-        
-        # Convert to mono
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        
-        # Resample
-        if orig_sr != self.sample_rate:
-            if self._resampler is None or self._resampler.orig_freq != orig_sr:
-                self._resampler = torchaudio.transforms.Resample(
-                    orig_freq=orig_sr,
-                    new_freq=self.sample_rate
-                )
-            waveform = self._resampler(waveform)
-        
-        # Squeeze to 1D
-        waveform = waveform.squeeze(0)
-        
-        # Pad or trim
-        if waveform.shape[0] > self.max_audio_length:
-            waveform = waveform[:self.max_audio_length]
-        elif waveform.shape[0] < self.max_audio_length:
-            padding = self.max_audio_length - waveform.shape[0]
-            waveform = torch.nn.functional.pad(waveform, (0, padding))
-        
-        # Augmentation
-        if self.audio_transform:
-            waveform = self.audio_transform(waveform)
-        
-        # Cache
-        if self.audio_cache is not None:
-            self.audio_cache[idx] = waveform
-        
-        return waveform
+        try:
+            # Load audio with soundfile (returns numpy array)
+            waveform, orig_sr = sf.read(str(full_path), dtype='float32')
+            
+            # Convert numpy to torch tensor
+            waveform = torch.from_numpy(waveform)
+            
+            # Handle shape: soundfile returns [samples] for mono, [samples, channels] for stereo
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)  # [samples] -> [1, samples]
+            else:
+                waveform = waveform.t()  # [samples, channels] -> [channels, samples]
+            
+            # Convert to mono if stereo
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            
+            # Resample if needed
+            if orig_sr != self.sample_rate:
+                if self._resampler is None or self._resampler.orig_freq != orig_sr:
+                    self._resampler = torchaudio.transforms.Resample(
+                        orig_freq=orig_sr,
+                        new_freq=self.sample_rate
+                    )
+                waveform = self._resampler(waveform)
+            
+            # Squeeze to 1D
+            waveform = waveform.squeeze(0)
+            
+            # Pad or trim
+            if waveform.shape[0] > self.max_audio_length:
+                waveform = waveform[:self.max_audio_length]
+            elif waveform.shape[0] < self.max_audio_length:
+                padding = self.max_audio_length - waveform.shape[0]
+                waveform = torch.nn.functional.pad(waveform, (0, padding))
+            
+            # Augmentation
+            if self.audio_transform:
+                waveform = self.audio_transform(waveform)
+            
+            # Cache
+            if self.audio_cache is not None:
+                self.audio_cache[idx] = waveform
+            
+            return waveform
+            
+        except Exception as e:
+            print(f"Error loading audio {full_path}: {e}")
+            return torch.zeros(self.max_audio_length)
 
 
 class AudioTextCollator:
     """
     Custom collator for DataLoader.
-    Batches audio-text pairs properly.
+    Batches audio-text pairs properly and preprocesses for CLAP.
     """
     
-    def __init__(self, tokenizer=None):
-        self.tokenizer = tokenizer
+    def __init__(self, audio_processor=None, sample_rate=48000):  # ✅ Correct
+        self.audio_processor = audio_processor
+        self.sample_rate = sample_rate
     
     def __call__(self, batch):
         """
@@ -152,15 +168,30 @@ class AudioTextCollator:
             batch: List of (audio, text) tuples
         
         Returns:
-            audio_batch: [batch_size, audio_length]
+            audio_batch: Preprocessed audio features
             text_batch: List of strings
         """
         audios, texts = zip(*batch)
         
-        # Stack audio tensors
-        audio_batch = torch.stack(audios)
-        
         # Keep texts as list (encoder will tokenize)
         text_batch = list(texts)
+        
+        # Preprocess audio if processor is available
+        if self.audio_processor is not None:
+            # Convert tensors to numpy arrays for the processor
+            audio_list = [audio.numpy() for audio in audios]
+            
+            # Use the feature extractor with correct sample rate
+            processed = self.audio_processor(
+                audio_list,
+                sampling_rate=self.sample_rate,  # Use the stored sample rate
+                return_tensors="pt"
+            )
+            
+            # Extract the processed features
+            audio_batch = processed['input_features']
+        else:
+            # Fallback: just stack tensors (won't work with CLAP)
+            audio_batch = torch.stack(audios)
         
         return audio_batch, text_batch

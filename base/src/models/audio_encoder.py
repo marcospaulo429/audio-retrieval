@@ -360,8 +360,14 @@ class CLAPAudioEncoder(nn.Module):
                 param.requires_grad = False
     
     def forward(self, audio_input: torch.Tensor, normalize: bool = True) -> torch.Tensor:
-        # The get_audio_features API handles the internal processing
-        embeddings = self.clap.get_audio_features(audio_input)
+        """
+        Args:
+            audio_input: Preprocessed audio features from CLAP processor
+                        Shape: [batch_size, 1, n_mels, time] or [batch_size, n_mels, time]
+        """
+        # CLAP's get_audio_features expects the preprocessed features
+        # The processor outputs 'input_features' which is already in the right format
+        embeddings = self.clap.get_audio_features(input_features=audio_input)
         
         # Lazy initialization of projection layer based on actual output dimension
         if not self._projection_initialized:

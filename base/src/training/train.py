@@ -1,54 +1,69 @@
-import os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from pathlib import Path
 from tqdm import tqdm
+import argparse
+import yaml
+import sys
+import os
+
+# Add src directory to Python path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models.audio_encoder import Wav2Vec2AudioEncoder
 from models.text_encoder import TextEncoder
 from models.joint_embedding import JointEmbeddingModel
 from data.dataset import AudioTextDataset, AudioTextCollator
 from training.loss import ContrastiveLoss
-from training.config import Config
+from utils import load_model_and_processor, load_dataset_splits
 
 
-def train_model(config: Config, device: torch.device, checkpoint_path: str = None):
-    """
-    Main training function.
+def train_model(config, device, checkpoint_path=None):
+    """Main training function.
     
     Args:
-        config: Configuration object
-        device: Device to train on
-        checkpoint_path: Path to resume from checkpoint
+        config: Configuration dictionary
+        device: Device to train on ('cuda' or 'cpu')
+        checkpoint_path: Optional path to checkpoint to resume from
     """
-    # Create checkpoint directory
-    Path(config.paths.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-    
-    # Initialize models
     print("Initializing models...")
-    audio_encoder = Wav2Vec2AudioEncoder(
-        model_name="facebook/wav2vec2-base",
-        embedding_dim=config.model.audio_embedding_dim,
-        dropout=config.model.dropout
-    ).to(device)
     
+    # Load audio encoder and processor
+    audio_encoder, audio_processor, target_sample_rate, model_input_key = load_model_and_processor(
+        encoder_name=config['audio_encoder']['name'],
+        model_name_or_path=config['audio_encoder']['model_name'],
+        device=device,
+        embedding_dim=config['audio_encoder']['embedding_dim'],
+        freeze=config['audio_encoder']['freeze']
+    )
+    
+    # Extract just the audio feature extractor from CLAP processor
+    if hasattr(audio_processor, 'feature_extractor'):
+        audio_feature_extractor = audio_processor.feature_extractor
+    else:
+        audio_feature_extractor = audio_processor
+    
+    # Load text encoder (assuming BERT-based)
+    from transformers import AutoTokenizer
+    
+    text_tokenizer = AutoTokenizer.from_pretrained(config['text_encoder']['model_name'])
     text_encoder = TextEncoder(
-        model_name=config.model.text_model_name,
-        embedding_dim=config.model.text_embedding_dim,
-        dropout=config.model.dropout
+        model_name=config['text_encoder']['model_name'],
+        embedding_dim=config['text_encoder']['embedding_dim'],
+        dropout=config['text_encoder'].get('dropout', 0.1)
     ).to(device)
     
     joint_model = JointEmbeddingModel(
         audio_encoder=audio_encoder,
         text_encoder=text_encoder,
-        embedding_dim=config.model.audio_embedding_dim,
-        temperature=config.model.temperature,
-        learnable_temperature=config.model.learnable_temperature
+        embedding_dim=config['audio_encoder']['embedding_dim'],
+        temperature=config.get('temperature', 0.07),
+        learnable_temperature=config.get('learnable_temperature', False)
     ).to(device)
     
-    # Load checkpoint if provided
+    # Load checkpoint if provided (use parameter, not config)
     start_epoch = 0
     if checkpoint_path and Path(checkpoint_path).exists():
         print(f"Loading checkpoint from {checkpoint_path}")
@@ -57,83 +72,119 @@ def train_model(config: Config, device: torch.device, checkpoint_path: str = Non
         start_epoch = checkpoint.get('epoch', 0) + 1
         print(f"Resuming from epoch {start_epoch}")
     
-    # Initialize datasets
-    print("\nLoading datasets...")
+    print("Loading datasets...")
     
-    # Check if data files exist
-    train_path = Path(config.paths.train_data_path)
-    val_path = Path(config.paths.val_data_path)
+    # Load dataset using factory function
+    train_df, test_df = load_dataset_splits(
+        dataset_name=config['dataset']['name'],
+        dataset_path=config['dataset'].get('path', None)
+    )
     
-    if not train_path.exists():
-        raise FileNotFoundError(f"Training data not found: {train_path}")
-    if not val_path.exists():
-        raise FileNotFoundError(f"Validation data not found: {val_path}")
+    print(f"Dataset loaded:")
+    print(f"  Train: {len(train_df)} samples")
+    print(f"  Test: {len(test_df)} samples")
+    print(f"  Columns: {list(train_df.columns)}")
     
-    # Get audio directory (assuming it's in data/audio or same dir as CSV)
-    audio_dir = train_path.parent / "audio"
-    if not audio_dir.exists():
-        audio_dir = None
-        print("Warning: No 'audio' directory found. Using absolute paths from CSV.")
+    # Determine if this is a captioning dataset
+    is_caption_dataset = 'caption' in train_df.columns
+    print(f"  Dataset type: {'Captioning' if is_caption_dataset else 'Classification'}")
     
+    # Rename columns to match AudioTextDataset expectations
+    train_df_renamed = train_df.copy()
+    test_df_renamed = test_df.copy()
+    
+    if 'file_path' in train_df.columns:
+        train_df_renamed = train_df_renamed.rename(columns={'file_path': 'audio_path'})
+        test_df_renamed = test_df_renamed.rename(columns={'file_path': 'audio_path'})
+    
+    if 'caption' in train_df.columns:
+        train_df_renamed = train_df_renamed.rename(columns={'caption': 'text'})
+        test_df_renamed = test_df_renamed.rename(columns={'caption': 'text'})
+    elif 'label' in train_df.columns:
+        train_df_renamed = train_df_renamed.rename(columns={'label': 'text'})
+        test_df_renamed = test_df_renamed.rename(columns={'label': 'text'})
+    
+    # Create datasets with correct arguments
     train_dataset = AudioTextDataset(
-        data_path=str(train_path),
-        audio_dir=str(audio_dir) if audio_dir else None,
-        sample_rate=16000,
-        max_audio_length=160000,
+        data_path=train_df_renamed,
+        audio_dir=None,  # Paths are absolute
+        sample_rate=target_sample_rate,  # Use CLAP's expected sample rate (48000)
+        max_audio_length=int(config['dataset']['max_audio_length'] * target_sample_rate),  # 10 sec * 48000 = 480000 samples
+        audio_transform=None,
         cache_audio=False
     )
     
-    val_dataset = AudioTextDataset(
-        data_path=str(val_path),
-        audio_dir=str(audio_dir) if audio_dir else None,
-        sample_rate=16000,
-        max_audio_length=160000,
+    test_dataset = AudioTextDataset(
+        data_path=test_df_renamed,
+        audio_dir=None,
+        sample_rate=target_sample_rate,  # Use CLAP's expected sample rate (48000)
+        max_audio_length=int(config['dataset']['max_audio_length'] * target_sample_rate),
+        audio_transform=None,
         cache_audio=False
     )
     
-    print(f"✓ Train samples: {len(train_dataset)}")
-    print(f"✓ Val samples: {len(val_dataset)}")
+    print(f"\nDatasets created:")
+    print(f"  Training samples: {len(train_dataset)}")
+    print(f"  Test samples: {len(test_dataset)}")
     
-    # Create collator
-    collator = AudioTextCollator()
+    # Create collator with audio feature extractor and correct sample rate
+    collator = AudioTextCollator(
+        audio_processor=audio_feature_extractor,
+        sample_rate=target_sample_rate  # Pass the CLAP sample rate (48000)
+    )
     
     # Create dataloaders
+    num_workers = config['training'].get('num_workers', 4)
+    # Set num_workers to 0 if on CPU to avoid multiprocessing issues
+    if device == 'cpu':
+        num_workers = 0
+        print("Running on CPU - setting num_workers=0")
+    
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.training.batch_size,
+        batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=(device == 'cuda'),
         collate_fn=collator,
         drop_last=True  # Drop last incomplete batch
     )
     
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.training.batch_size,
+        test_dataset,
+        batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=(device == 'cuda'),
         collate_fn=collator
     )
     
+    print(f"DataLoaders created:")
+    print(f"  Train batches: {len(train_loader)}")
+    print(f"  Val batches: {len(val_loader)}")
+    print(f"  Batch size: {config['training']['batch_size']}")
+    
     # Initialize loss and optimizer
-    criterion = ContrastiveLoss(temperature=config.model.temperature)
+    criterion = ContrastiveLoss(temperature=config.get('temperature', 0.07))
     
     optimizer = torch.optim.AdamW(
         joint_model.parameters(),
-        lr=config.training.learning_rate,
-        weight_decay=config.training.weight_decay
+        lr=config['training']['learning_rate'],
+        weight_decay=config['training'].get('weight_decay', 0.01)
     )
     
     # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=config.training.num_epochs
+        T_max=config['training']['num_epochs']
     )
     
     # Mixed precision training
-    scaler = GradScaler() if config.training.mixed_precision else None
+    use_amp = config['training'].get('mixed_precision', False) and device == 'cuda'
+    scaler = GradScaler() if use_amp else None
+    
+    if use_amp:
+        print("Using mixed precision training")
     
     # Training loop
     print(f"\n{'='*60}")
@@ -141,10 +192,12 @@ def train_model(config: Config, device: torch.device, checkpoint_path: str = Non
     print(f"{'='*60}\n")
     
     best_val_loss = float('inf')
+    checkpoint_dir = Path(config.get('checkpoint_dir', 'checkpoints'))
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
-    for epoch in range(start_epoch, config.training.num_epochs):
+    for epoch in range(start_epoch, config['training']['num_epochs']):
         print(f"\n{'='*60}")
-        print(f"Epoch {epoch + 1}/{config.training.num_epochs}")
+        print(f"Epoch {epoch + 1}/{config['training']['num_epochs']}")
         print(f"{'='*60}")
         
         # Train
@@ -168,14 +221,15 @@ def train_model(config: Config, device: torch.device, checkpoint_path: str = Non
         print(f"{'='*60}")
         
         # Save checkpoint
-        if (epoch + 1) % config.logging.save_model_interval == 0:
-            checkpoint_path = Path(config.paths.checkpoint_dir) / f"checkpoint_epoch_{epoch + 1}.pth"
-            save_checkpoint(joint_model, optimizer, epoch, train_loss, val_loss, checkpoint_path)
+        save_interval = config.get('save_interval', 5)
+        if (epoch + 1) % save_interval == 0:
+            checkpoint_path_save = checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pth"
+            save_checkpoint(joint_model, optimizer, epoch, train_loss, val_loss, checkpoint_path_save)
         
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_path = Path(config.paths.checkpoint_dir) / "best_model.pth"
+            best_path = checkpoint_dir / "best_model.pth"
             save_checkpoint(joint_model, optimizer, epoch, train_loss, val_loss, best_path)
             print(f"✓ New best model saved! (Val Loss: {val_loss:.4f})")
     
@@ -192,9 +246,14 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, config,
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1} [Train]")
     
-    for batch_idx, (audio, text) in enumerate(pbar):
-        audio = audio.to(device)
-        # text is a list of strings
+    for batch_idx, batch in enumerate(pbar):
+        # Unpack batch - could be (audio, text) or dict
+        if isinstance(batch, dict):
+            audio = batch['audio'].to(device)
+            text = batch['text']
+        else:
+            audio, text = batch
+            audio = audio.to(device)
         
         optimizer.zero_grad()
         
@@ -209,9 +268,10 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, config,
             scaler.scale(loss).backward()
             
             # Gradient clipping
-            if config.training.gradient_clip > 0:
+            gradient_clip = config['training'].get('gradient_clip', 1.0)
+            if gradient_clip > 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.gradient_clip)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
             
             scaler.step(optimizer)
             scaler.update()
@@ -221,8 +281,9 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, config,
             loss = criterion(audio_emb, text_emb)
             loss.backward()
             
-            if config.training.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.gradient_clip)
+            gradient_clip = config['training'].get('gradient_clip', 1.0)
+            if gradient_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
             
             optimizer.step()
         
@@ -240,8 +301,14 @@ def validate_epoch(model, dataloader, criterion, device, config):
     with torch.no_grad():
         pbar = tqdm(dataloader, desc="Validation")
         
-        for audio, text in pbar:
-            audio = audio.to(device)
+        for batch in pbar:
+            # Unpack batch
+            if isinstance(batch, dict):
+                audio = batch['audio'].to(device)
+                text = batch['text']
+            else:
+                audio, text = batch
+                audio = audio.to(device)
             
             audio_emb, text_emb = model(audio, texts=text, return_embeddings=True)
             loss = criterion(audio_emb, text_emb)
@@ -265,10 +332,35 @@ def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, path):
 
 
 if __name__ == "__main__":
-    from training.config import Config
+    parser = argparse.ArgumentParser(description="Train audio-text retrieval model")
+    parser.add_argument('--config', type=str, default='configs/config.yaml',
+                       help='Path to config file')
+    parser.add_argument('--dataset_name', type=str, default=None,
+                       help='Dataset name (overrides config): esc50, urbansound8k, gtzan, clotho, etc.')
+    parser.add_argument('--dataset_path', type=str, default=None,
+                       help='Path to dataset directory (overrides config)')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                       help='Path to checkpoint to resume from')
+    parser.add_argument('--device', type=str, default=None,
+                       help='Device to use: cuda or cpu (overrides config)')
     
-    config = Config()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    args = parser.parse_args()
     
+    # Load config
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Override config with command-line arguments
+    if args.dataset_name:
+        config['dataset']['name'] = args.dataset_name
+    if args.dataset_path:
+        config['dataset']['path'] = args.dataset_path
+    if args.device:
+        config['device'] = args.device
+    
+    # Set device
+    device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    train_model(config, device)
+    
+    # Train model
+    train_model(config, device, checkpoint_path=args.checkpoint)
