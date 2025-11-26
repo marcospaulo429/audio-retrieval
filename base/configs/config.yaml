@@ -2,19 +2,20 @@ model:
   audio_embedding_dim: 512
   text_embedding_dim: 512
   temperature: 0.07
-  learnable_temperature: true
+  learnable_temperature: false
   text_model_name: "sentence-transformers/all-MiniLM-L6-v2"
   audio_model_type: "cnn"
   dropout: 0.1
 
 training:
-  batch_size: 32
+  batch_size: 8
   learning_rate: 0.0001
-  num_epochs: 50
+  num_epochs: 10
   weight_decay: 0.01
   warmup_steps: 1000
   gradient_clip: 1.0
-  mixed_precision: true
+  mixed_precision: false
+  num_workers: 0
 
 paths:
   audio_model_path: "models/audio_encoder.pth"
@@ -23,9 +24,27 @@ paths:
   train_data_path: "data/train_data.csv"
   val_data_path: "data/val_data.csv"
   checkpoint_dir: "checkpoints"
+  save_interval: 5
 
 logging:
   log_interval: 10
   save_model_interval: 5
   use_wandb: false
   wandb_project: "audio-text-retrieval"
+
+dataset:
+  name: 'clotho'  # Change to 'clotho' for Clotho dataset
+  path: null  # Optional: local path, null for HuggingFace datasets
+  max_audio_length: 10  # seconds
+  max_text_length: 128  # tokens
+
+audio_encoder:
+  name: 'clap'  # or 'wav2vec2', 'hubert', 'ast', 'custom_cnn'
+  model_name: 'laion/clap-htsat-unfused'
+  embedding_dim: 512
+  freeze: true
+
+text_encoder:
+  model_name: 'bert-base-uncased'
+  embedding_dim: 512
+  dropout: 0.1

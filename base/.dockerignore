@@ -10,6 +10,17 @@ ENV/
 *.egg-info/
 dist/
 build/
+archive/
+chromadb/
+ESC-50/
+UrbanSound8K/
+GTZAN/
+NSynth/
+AudioSet/
+LibriSpeech/
+LibriTTS/
+LibriMix/
+LibriMix/
 
 # IDE
 .vscode/

@@ -337,35 +337,47 @@ class CNNTransformerAudioEncoder(nn.Module):
 class CLAPAudioEncoder(nn.Module):
     """
     Use CLAP's audio encoder directly.
-    Pre-trained on audio-text pairs - perfect for your use case!
+    Pre-trained on audio-text pairs.
     """
     
     def __init__(
         self,
-        model_name: str = "laion/clap-htsat-unfused",
+        model_name: str = "laion/clap-htsat-unfused",  # You can swap this, e.g., "microsoft/clap-base-uncased"
         embedding_dim: int = 512,
-        freeze: bool = False
+        freeze: bool = True  # Default True for inference
     ):
         super().__init__()
         
         from transformers import ClapModel
         
         self.clap = ClapModel.from_pretrained(model_name)
-        self.audio_encoder = self.clap.audio_model
-        self.hidden_size = 512  # CLAP default
+        self.embedding_dim = embedding_dim
+        self.projection = None  # Will be initialized lazily on first forward pass
+        self._projection_initialized = False
         
         if freeze:
-            for param in self.audio_encoder.parameters():
+            for param in self.clap.parameters():
                 param.requires_grad = False
-        
-        # Optional projection if you want different embedding_dim
-        if embedding_dim != self.hidden_size:
-            self.projection = nn.Linear(self.hidden_size, embedding_dim)
-        else:
-            self.projection = nn.Identity()
     
     def forward(self, audio_input: torch.Tensor, normalize: bool = True) -> torch.Tensor:
-        embeddings = self.clap.get_audio_features(audio_input)
+        """
+        Args:
+            audio_input: Preprocessed audio features from CLAP processor
+                        Shape: [batch_size, 1, n_mels, time] or [batch_size, n_mels, time]
+        """
+        # CLAP's get_audio_features expects the preprocessed features
+        # The processor outputs 'input_features' which is already in the right format
+        embeddings = self.clap.get_audio_features(input_features=audio_input)
+        
+        # Lazy initialization of projection layer based on actual output dimension
+        if not self._projection_initialized:
+            actual_output_dim = embeddings.shape[-1]
+            if self.embedding_dim != actual_output_dim:
+                self.projection = nn.Linear(actual_output_dim, self.embedding_dim).to(embeddings.device)
+            else:
+                self.projection = nn.Identity()
+            self._projection_initialized = True
+        
         embeddings = self.projection(embeddings)
         
         if normalize:

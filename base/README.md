@@ -58,7 +58,7 @@ The project is organized into the following directories and files:
 docker build -t audio-retrieval:latest .
 
 # Run the container
-docker run -p 8000:8000 -v $(pwd)/data:/app/data audio-retrieval:latest
+docker run --rm -it -p 8000:8000 -v $(pwd)/data:/app/data audio-retrieval:latest bash
 
 # Or use docker-compose
 docker-compose up -d

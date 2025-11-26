@@ -1,0 +1,14 @@
+ESC-50/
+UrbanSound8K/
+chromadb/
+models/
+logs/
+checkpoints/
+data/
+venv/
+.env
+.DS_Store
+.idea/
+.vscode/
+.pytest_cache/
+archive/

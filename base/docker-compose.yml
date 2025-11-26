@@ -1,33 +1,13 @@
-version: '3.8'
-
 services:
-  audio-retrieval:
-    build:
-      context: .
-      dockerfile: Dockerfile
+  audio-retrieval-app:
+    build: .
     container_name: audio-retrieval-app
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./configs:/app/configs
+      - ./checkpoints:/app/checkpoints
     ports:
       - "8000:8000"
-    volumes:
-      # Mount data directory
-      - ./data:/app/data
-      # Mount models directory for checkpoints
-      - ./checkpoints:/app/checkpoints
-      # Mount logs directory
-      - ./logs:/app/logs
-      # Mount config for easy updates
-      - ./configs:/app/configs
-    environment:
-      - ENVIRONMENT=production
-      - LOG_LEVEL=info
-      - PYTHONUNBUFFERED=1
-    # Uncomment for GPU support (NVIDIA)
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-    command: python src/app.py --mode train
-    restart: unless-stopped
+      - "6006:6006"  # Add this for TensorBoard
+    command: tail -f /dev/null

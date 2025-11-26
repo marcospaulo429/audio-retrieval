@@ -13,8 +13,21 @@ soundfile>=0.12.0
 tqdm>=4.65.0
 pyyaml>=6.0
 
+# Evaluation metrics
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Experiment tracking and visualization
+tensorboard>=2.14.0
+pillow>=10.0.0
+
+# Hugging Face datasets support
+datasets>=2.14.0
+
 # Optional: Vector database for retrieval
 # faiss-cpu>=1.7.4  # or faiss-gpu for GPU support
+chromadb>=0.4.0
 
 # Optional: API serving
 # fastapi>=0.100.0
